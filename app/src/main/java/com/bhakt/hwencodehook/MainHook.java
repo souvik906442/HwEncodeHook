@@ -1,5 +1,8 @@
 package com.bhakt.hwencodehook;
 
+import android.media.MediaMetadataRetriever;
+
+import java.io.File;
 import java.lang.reflect.Member;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -11,11 +14,6 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/**
- * Video Compressor & Converter (com.videoconverter.videocompressor) ffmpeg-kit দিয়ে libx264 (CPU)
- * ব্যবহার করে। এই hook ffmpeg চালানোর ঠিক আগে argument বদলে h264_mediacodec (hardware) বসায়।
- * hardware encode ব্যর্থ হলে আগের (মূল) argument দিয়ে আবার চালায়।
- */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TARGET_PKG = "com.videoconverter.videocompressor";
@@ -23,8 +21,10 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String EXTRA_ORIG = "hw_orig_args";
     private static final int RETURN_OK = 0;
     private static final int RETURN_CANCEL = 255;
+    private static final String EXTRA_INSIZE = "hw_in_size";
+    private static final double BITRATE_FRACTION = 0.4;
+    private static final double MAX_OUT_RATIO = 0.9;
 
-    // mediacodec encoder এই option গুলো বোঝে না, তাই value সহ বাদ যাবে
     private static final List<String> DROP_WITH_VALUE = Arrays.asList(
             "-crf", "-preset", "-profile:v", "-tune", "-x264-params", "-x264opts",
             "-color_range", "-level", "-level:v");
@@ -47,6 +47,9 @@ public class MainHook implements IXposedHookLoadPackage {
                                 String[] repl = rewrite(orig);
                                 if (repl != null) {
                                     param.setObjectExtra(EXTRA_ORIG, orig);
+                                    String in = valueAfter(orig, "-i");
+                                    long inSize = in == null ? 0 : new File(in).length();
+                                    param.setObjectExtra(EXTRA_INSIZE, Long.valueOf(inSize));
                                     param.args[1] = repl;
                                     XposedBridge.log(TAG + "hardware encode: " + Arrays.toString(repl));
                                 }
@@ -62,9 +65,20 @@ public class MainHook implements IXposedHookLoadPackage {
                                 if (orig == null) return;
                                 Object res = param.getResult();
                                 int code = (res instanceof Integer) ? (Integer) res : RETURN_OK;
-                                if (code != RETURN_OK && code != RETURN_CANCEL) {
-                                    XposedBridge.log(TAG + "hardware encode failed (" + code
-                                            + "), software x264 দিয়ে আবার চেষ্টা");
+                                boolean tooBig = false;
+                                if (code == RETURN_OK) {
+                                    Object o = param.getObjectExtra(EXTRA_INSIZE);
+                                    long inSize = (o instanceof Long) ? (Long) o : 0L;
+                                    File out = new File(orig[orig.length - 1]);
+                                    if (inSize > 0 && out.exists() && out.length() > inSize * MAX_OUT_RATIO) {
+                                        tooBig = true;
+                                        XposedBridge.log(TAG + "output " + out.length() + " B is not smaller than input "
+                                                + inSize + " B");
+                                    }
+                                }
+                                if (tooBig || (code != RETURN_OK && code != RETURN_CANCEL)) {
+                                    XposedBridge.log(TAG + "hardware encode failed or too big (" + code
+                                            + "), retry with software x264");
                                     Object[] a = new Object[]{param.args[0], orig};
                                     Object r2 = XposedBridge.invokeOriginalMethod(
                                             (Member) param.method, param.thisObject, a);
@@ -81,7 +95,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** libx264 না থাকলে null ফেরত দেয় (কিছু বদলানো হয় না)। */
     static String[] rewrite(String[] args) {
         if (args == null) return null;
         boolean has264 = false;
@@ -91,10 +104,27 @@ public class MainHook implements IXposedHookLoadPackage {
         if (!has264) return null;
 
         List<String> out = new ArrayList<>(args.length);
+        long cur = 0;
+        for (int i = 0; i < args.length - 1; i++) {
+            if ("-b:v".equals(args[i]) || "-vb".equals(args[i])) cur = parseBitrate(args[i + 1]);
+        }
+        String in = valueAfter(args, "-i");
+        long src = in == null ? 0 : probeBitrate(in);
+        long target = src > 0 ? (long) (src * BITRATE_FRACTION) : 0;
+        boolean setBr = false;
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
             if (DROP_WITH_VALUE.contains(a)) {
-                i++; // value ও বাদ
+                i++;
+                continue;
+            }
+            if ("-b:v".equals(a) || "-vb".equals(a)) {
+                long use = cur;
+                if (target > 0 && (cur <= 0 || cur > target)) use = target;
+                out.add("-b:v");
+                out.add(String.valueOf(use > 0 ? use : cur));
+                setBr = true;
+                i++;
                 continue;
             }
             if ("libx264".equals(a)) {
@@ -103,6 +133,44 @@ public class MainHook implements IXposedHookLoadPackage {
                 out.add(a);
             }
         }
+        if (!setBr) {
+            long use = target > 0 ? target : 1_000_000L;
+            int pos = out.size() - 1;
+            out.add(pos, String.valueOf(use));
+            out.add(pos, "-b:v");
+        }
         return out.toArray(new String[0]);
+    }
+
+    static String valueAfter(String[] args, String key) {
+        for (int i = 0; i < args.length - 1; i++) {
+            if (key.equals(args[i])) return args[i + 1];
+        }
+        return null;
+    }
+
+    static long parseBitrate(String v) {
+        try {
+            String t = v.trim().toLowerCase();
+            double m = 1;
+            if (t.endsWith("k")) { m = 1000; t = t.substring(0, t.length() - 1); }
+            else if (t.endsWith("m")) { m = 1_000_000; t = t.substring(0, t.length() - 1); }
+            return (long) (Double.parseDouble(t) * m);
+        } catch (Throwable e) {
+            return 0;
+        }
+    }
+
+    static long probeBitrate(String path) {
+        MediaMetadataRetriever r = new MediaMetadataRetriever();
+        try {
+            r.setDataSource(path);
+            String b = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE);
+            return b == null ? 0 : Long.parseLong(b);
+        } catch (Throwable e) {
+            return 0;
+        } finally {
+            try { r.release(); } catch (Throwable ignored) { }
+        }
     }
 }
