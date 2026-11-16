@@ -14,6 +14,11 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
+/**
+ * Video Compressor & Converter (com.videoconverter.videocompressor) ffmpeg-kit দিয়ে libx264 (CPU)
+ * ব্যবহার করে। এই hook ffmpeg চালানোর ঠিক আগে argument বদলে h264_mediacodec (hardware) বসায়।
+ * hardware encode ব্যর্থ হলে আগের (মূল) argument দিয়ে আবার চালায়।
+ */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TARGET_PKG = "com.videoconverter.videocompressor";
@@ -22,9 +27,16 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int RETURN_OK = 0;
     private static final int RETURN_CANCEL = 255;
     private static final String EXTRA_INSIZE = "hw_in_size";
+    /** target bitrate = this fraction of the source video bitrate, so the file always gets smaller */
     private static final double BITRATE_FRACTION = 0.4;
-    private static final double MAX_OUT_RATIO = 0.9;
+    /** wanted output size: this many MB per minute of video (15 min -> ~30 MB). Change this to taste. */
+    private static final double MB_PER_MIN = 2.0;
+    /** if the result is still bigger than MB_PER_MIN * this, redo it with software x264 */
+    private static final double SLACK = 1.5;
+    /** assumed audio bitrate (bits/s) when the app gives none */
+    private static final long AUDIO_BPS = 64_000L;
 
+    // mediacodec encoder এই option গুলো বোঝে না, তাই value সহ বাদ যাবে
     private static final List<String> DROP_WITH_VALUE = Arrays.asList(
             "-crf", "-preset", "-profile:v", "-tune", "-x264-params", "-x264opts",
             "-color_range", "-level", "-level:v");
@@ -69,16 +81,22 @@ public class MainHook implements IXposedHookLoadPackage {
                                 if (code == RETURN_OK) {
                                     Object o = param.getObjectExtra(EXTRA_INSIZE);
                                     long inSize = (o instanceof Long) ? (Long) o : 0L;
+                                    String in = valueAfter(orig, "-i");
+                                    long durMs = in == null ? 0 : probeDurationMs(in);
                                     File out = new File(orig[orig.length - 1]);
-                                    if (inSize > 0 && out.exists() && out.length() > inSize * MAX_OUT_RATIO) {
-                                        tooBig = true;
-                                        XposedBridge.log(TAG + "output " + out.length() + " B is not smaller than input "
-                                                + inSize + " B");
+                                    if (out.exists()) {
+                                        long limit = durMs > 0
+                                                ? (long) (MB_PER_MIN * 1048576.0 * (durMs / 60000.0) * SLACK)
+                                                : (inSize > 0 ? (long) (inSize * 0.9) : 0L);
+                                        if (limit > 0 && out.length() > limit) {
+                                            tooBig = true;
+                                            XposedBridge.log(TAG + "output " + out.length() + " B > limit " + limit + " B");
+                                        }
                                     }
                                 }
                                 if (tooBig || (code != RETURN_OK && code != RETURN_CANCEL)) {
                                     XposedBridge.log(TAG + "hardware encode failed or too big (" + code
-                                            + "), retry with software x264");
+                                            + "), software x264 দিয়ে আবার চেষ্টা");
                                     Object[] a = new Object[]{param.args[0], orig};
                                     Object r2 = XposedBridge.invokeOriginalMethod(
                                             (Member) param.method, param.thisObject, a);
@@ -95,6 +113,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    /** libx264 না থাকলে null ফেরত দেয় (কিছু বদলানো হয় না)। */
     static String[] rewrite(String[] args) {
         if (args == null) return null;
         boolean has264 = false;
@@ -110,12 +129,17 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         String in = valueAfter(args, "-i");
         long src = in == null ? 0 : probeBitrate(in);
-        long target = src > 0 ? (long) (src * BITRATE_FRACTION) : 0;
+        // total bits/s for MB_PER_MIN, minus audio = video bitrate
+        long aud = parseBitrate(valueAfter(args, "-b:a") == null ? "0" : valueAfter(args, "-b:a"));
+        if (aud <= 0) aud = AUDIO_BPS;
+        long budget = (long) (MB_PER_MIN * 1048576.0 * 8.0 / 60.0) - aud;
+        long target = Math.max(budget, 80_000L);
+        if (src > 0) target = Math.min(target, (long) (src * BITRATE_FRACTION));
         boolean setBr = false;
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
             if (DROP_WITH_VALUE.contains(a)) {
-                i++;
+                i++; // value ও বাদ
                 continue;
             }
             if ("-b:v".equals(a) || "-vb".equals(a)) {
@@ -134,8 +158,9 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
         if (!setBr) {
+            // app gave no bitrate (crf only): give the hardware encoder one, otherwise it picks its own (often huge)
             long use = target > 0 ? target : 1_000_000L;
-            int pos = out.size() - 1;
+            int pos = out.size() - 1; // keep the output path last
             out.add(pos, String.valueOf(use));
             out.add(pos, "-b:v");
         }
@@ -149,6 +174,7 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
+    /** "2M", "800k", "1500000" -> bits per second; 0 if unknown. */
     static long parseBitrate(String v) {
         try {
             String t = v.trim().toLowerCase();
@@ -161,6 +187,20 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    static long probeDurationMs(String path) {
+        MediaMetadataRetriever r = new MediaMetadataRetriever();
+        try {
+            r.setDataSource(path);
+            String d = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+            return d == null ? 0 : Long.parseLong(d);
+        } catch (Throwable e) {
+            return 0;
+        } finally {
+            try { r.release(); } catch (Throwable ignored) { }
+        }
+    }
+
+    /** Bitrate of the source video file in bits/s (0 if it cannot be read). */
     static long probeBitrate(String path) {
         MediaMetadataRetriever r = new MediaMetadataRetriever();
         try {
