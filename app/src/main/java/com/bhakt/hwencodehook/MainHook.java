@@ -97,7 +97,16 @@ public class MainHook implements IXposedHookLoadPackage {
                                 if (tooBig || (code != RETURN_OK && code != RETURN_CANCEL)) {
                                     XposedBridge.log(TAG + "hardware encode failed or too big (" + code
                                             + "), software x264 দিয়ে আবার চেষ্টা");
-                                    Object[] a = new Object[]{param.args[0], orig};
+                                    // the hardware attempt left an output file: remove it, and allow overwrite,
+                                    // otherwise ffmpeg asks "Overwrite?" and fails
+                                    try { new File(orig[orig.length - 1]).delete(); } catch (Throwable ignored) { }
+                                    String[] retry = orig;
+                                    if (!Arrays.asList(orig).contains("-y")) {
+                                        retry = new String[orig.length + 1];
+                                        retry[0] = "-y";
+                                        System.arraycopy(orig, 0, retry, 1, orig.length);
+                                    }
+                                    Object[] a = new Object[]{param.args[0], retry};
                                     Object r2 = XposedBridge.invokeOriginalMethod(
                                             (Member) param.method, param.thisObject, a);
                                     param.setResult(r2);
